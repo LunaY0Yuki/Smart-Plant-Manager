@@ -1,0 +1,626 @@
+#include <SD.h>
+#include <string.h>
+#include "SPI.h"
+#include "Adafruit_GFX.h"//the general library that enables the LCD to display text
+#include "Adafruit_ILI9340.h"//the specific library for my TXT LCD ILI9340
+#include <EEPROM.h>//library to store value in arduino's "internal storage"
+#include <SoftwareSerial.h>//libirary for blynk(to make connection through usb port)
+SoftwareSerial DebugSerial(2, 3); // RX, TX
+#define BLYNK_PRINT DebugSerial
+#include <BlynkSimpleStream.h>
+
+#if defined(__SAM3Xco8E__)
+    #undef __FlashStringHelper::F(string_literal)
+    #define F(string_literal) string_literal
+#endif
+
+//file to read the quiz
+File myFile;
+
+//setup pins for sensors and buttons
+int tempPin = A0;
+int humPin = A1;
+int waterPin = A2;
+int motor = A4;
+const int enterPin = 2;
+const int backPin =7;
+const int choosePin = 6;
+
+//configure pin for LCD(CS = 8, D/C = 9, RST = 0)
+Adafruit_ILI9340 tft = Adafruit_ILI9340(8, 9, 0);
+
+float degreesC;
+float degreesF;
+
+//These are global variables that determine is the button is pressed or not
+int enterState; //the ENTER button that is used in most part of the menu(except the quiz)
+int enterStateQ; //the ENTER button before the quiz starts
+int enterStateA; //the ENTER button to confirm answer in the quiz
+
+int chooseState; //the CURSOR button that is used in most part of the menu(except the quiz)
+int chooseStateQ; //the CURSOR to select answer in the quiz
+
+int counter = 0; //counter used to read each letter in the file(for questions and options) in SD card during the quiz
+int counterAC = 0; //counter used to read each letter in the answer for each questoin in SD card during the quiz
+
+int back = 0;
+int enter = 9;
+int choose = 0;
+int quiz = 9;
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+   -These are global variables that solve the pressed and released problem.
+   -Basically how it works is that when a button is pressed, a specific variable 
+   will change to a certain value. There is an if-else statement corresponding to
+   that value.
+
+   back=1
+   When the BACK button is pressed, it is set to 1(in its if-else statement,
+   it also reset some variables)
+   back=0
+   print menu on LCD
+
+   enter=9
+   in the menu(before the ENTER button is pressed)
+   enter=1
+   When the BACK button is pressed, it is set to 1
+   enter=4
+   Display plant's statues on LCD
+   enter=5
+   Display user points on LCD
+   enter=6
+   Display the prompt to start the quiz
+   When enter == 6, enterStateQ instead of enterState reads the button anymore.
+   enter=7
+   Display Blynk info and start Blynk
+
+   choose=0
+   Select "Plant's Status"
+   choose=1
+   Select "User Point"
+   choose=2
+   Select "Quiz"
+   choose=3
+   Select "Blynk"
+
+   quiz=9
+   When Arduino is not running the quiz, it is set to 9 as default
+   quiz=1
+   Print the question and the choices
+   quiz=2
+   Select your answer and comfirm your answer
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+//These are global variables that is used in the quiz
+int quizSelect = 0;
+int quizAnswer = 9;
+int randNumber;
+int randNumberStart = 9;
+
+//These are variables to count when to use BLYNK to send a email
+int callCounter = 0;
+int maxCalls = 1;
+int calls = 0;
+int x = 9;
+//These are variables to allow the water pump to work
+int water = 0;
+int motorStart = 1;
+
+//to store user pt in arduino's hardrive
+int addr = 0;
+byte value;
+int userPt;
+
+//character to store the right answer for a specific question
+char answerCheck [] = "";
+
+void setup() {
+  Serial.begin(9600);
+  while (!Serial);
+
+  //humidity sensor can only work when it is set to output
+  pinMode(waterPin, OUTPUT);
+  pinMode(humPin, OUTPUT);
+  pinMode(motor, INPUT);
+
+  //make the random number generator generate differently each time
+  randomSeed(analogRead(3));
+
+  //reset user pt
+  //userPt = 80;
+  //EEPROM.write(addr, userPt);
+  
+     
+  SD.begin(4);
+  Blynk.begin("42d41b05da25412ebbfc83ca64121647", Serial);
+  tft.begin();
+  tft.setRotation(1); //make the screen display horizontally
+  tft.fillScreen(ILI9340_BLACK);//clear the screen
+}
+
+void loop(void) {
+  //This controls how the ENTER and CURSOR button is used outside of the quiz
+  if (quiz == 9 && enter != 6){
+    enterState = digitalRead(enterPin);
+    chooseState = digitalRead(choosePin);
+  }
+  //This controls how the CURSOR button is used to select answer in the quiz
+  if (quiz == 1 || quiz == 2){
+    chooseStateQ = digitalRead(choosePin);
+  }
+  //This controls how the ENTER button is used to start the quiz
+  if (enter == 6){
+    enterStateQ = digitalRead(enterPin);
+  }
+  //This controls how the ENTER button is used to confirm the selected answer during the quiz
+  if (quiz == 1 || quiz == 2){
+    enterStateA = digitalRead(enterPin);
+    chooseStateQ = digitalRead(choosePin);
+  }
+  //when a button is pressed
+  if (enterState == HIGH){
+    //clean the screen so that new text can be printed on the LCD
+    tft.fillScreen(ILI9340_BLACK);
+    //enter is set to equal 1 to indicate that the ENTER button is pressed and released
+    enter = 1;
+  }
+  else if (digitalRead(backPin) == HIGH){
+  //I use digitalRead instead of variables for the BACK button because it only has 1 purpose(return back the main menu)
+  tft.fillScreen(ILI9340_BLACK);
+  back = 1;
+  }
+  else if (chooseState == HIGH){
+  //Because the LCD draw small white squares to select menu item, it needs to cover the previous square before drawing a new on
+  tft.fillRect(0, 60, 30, 120, ILI9340_BLACK);
+  //tft.fillRect(0, 90, 30, 30, ILI9340_BLACK);
+  //tft.fillRect(0, 120, 30, 30, ILI9340_BLACK);
+  
+  choose += 1;
+  delay (10);
+  }
+  //to make sure that the water pump will not run when it is not supposed to
+  if(water!=1){
+    analogWrite(motor, 0);
+  }
+  //convert the temperature sensor's raw reading into Celsius and Farienhient
+  degreesC = analogRead(tempPin) * 0.48828 - 50;
+  degreesF = degreesC * 1.8 + 32.0;
+
+  //menu
+  if(back == 1){
+    enter = 9;
+    quiz = 9;
+    randNumberStart = 0;
+    Blynk.disconnect();
+    water = 0;
+    
+    back = 0;  
+   }
+   else if(back == 0 && enter == 9){
+      
+  tft.setCursor(0, 0);
+  tft.setTextColor(ILI9340_MAGENTA);
+  tft.setTextSize(6);
+  tft.println("~ MENU ~");
+  
+  tft.setCursor(30, 60);  
+  tft.setTextColor(ILI9340_GREEN);
+  tft.setTextSize(3);
+  tft.println("->Plant's Status");
+  tft.setCursor(30, 90);  
+  tft.setTextColor(ILI9340_BLUE);
+  tft.setTextSize(3);
+  tft.println("->User Page");  
+  tft.setCursor(30, 120);
+  tft.setTextColor(ILI9340_YELLOW);
+  tft.setTextSize(3);
+  tft.println("->Quiz");  
+  tft.setCursor(30,150);
+ tft.setTextColor(ILI9340_CYAN);
+  tft.setTextSize(3);
+  tft.println("->Blynk");  
+   }
+   
+  //eraser for cursor
+  //enter != 4 && enter != 5 && enter != 6 && enter != 1 && back == 0
+   if(enter == 9 && back == 0){
+    if(choose == 0){
+      tft.fillRect(10, 60, 15,15, ILI9340_WHITE);
+    }
+    else if(choose == 1){
+      tft.fillRect(10, 90, 15,15, ILI9340_WHITE);
+    }
+    else if(choose == 2){
+      tft.fillRect(10, 120, 15,15, ILI9340_WHITE);
+    }
+    else if(choose == 3){
+      tft.fillRect(10, 150, 15,15, ILI9340_WHITE);
+    }
+    else if(choose > 3){
+    choose = 0;
+   }
+
+   }
+
+
+   String humidity;
+    //don't use humError yet(just a minor feature)
+    if(analogRead(humPin)==0){
+      humidity = "ERROR";
+      delay(10);
+      motorStart = 2;
+     }
+     else if(analogRead(humPin)>0 && analogRead(humPin)<=300){
+      humidity = "DRY";
+      motorStart += 1;
+     }
+     else if(analogRead(humPin)>300 && analogRead(humPin)<=700){
+      humidity = "WET";
+      motorStart = 2;
+     }
+     else if(analogRead(humPin)>700){
+      humidity = "FLOOD!";
+      motorStart = 2;
+     }
+   //water pump condition(use 1 user point to water plant each time)
+   if(enter != 7 && quiz == 9){
+    if (analogRead(waterPin) > 100){
+    
+    if(motorStart >= 25 && userPt > 0){
+      water = 1;
+    }
+    if (water == 1){
+      tft.fillScreen(ILI9340_BLACK);
+      tft.setCursor(0, 0);
+      tft.setTextColor(ILI9340_BLUE);
+      tft.setTextSize(4);
+      tft.println("Watering..."); 
+      Serial.println("motor"); 
+      analogWrite(motor, 255);
+      delay(5000);
+      analogWrite(motor, 0);
+
+      userPt -= 1;
+      EEPROM.write(addr, userPt);
+      tft.fillScreen(ILI9340_BLACK);
+      
+      motorStart = 0;
+      water = 0;
+    }
+   }
+   }
+ 
+   
+  //plant status
+   if(choose == 0 && enter == 1){
+      back = 3;
+      enter = 4;
+   }
+   if (enter == 4){
+   //printing on LCD of plant's status
+      tft.setCursor(0, 0);
+      tft.setTextColor(ILI9340_BLUE);
+      tft.setTextSize(4);
+      tft.println("Humidity:");  
+      tft.fillRect(0, 30, 320, 50, ILI9340_BLACK);
+      tft.setTextColor(ILI9340_WHITE);
+      tft.setTextSize(3);
+      tft.print(analogRead(humPin));
+      tft.print("   ");
+      tft.println(humidity);
+      tft.println();
+      tft.setTextColor(ILI9340_CYAN);
+      tft.setTextSize(4);
+      tft.println("Temperature:");  
+      tft.fillRect(0, 110, 320, 50, ILI9340_BLACK);
+      tft.setTextColor(ILI9340_WHITE);
+      tft.setTextSize(3);
+      tft.print(degreesC);
+      tft.print("C");
+      tft.print("   ");
+      tft.print(degreesF);
+      tft.println("F");
+      tft.println();
+      tft.setTextColor(ILI9340_BLUE);
+      tft.setTextSize(4);
+      tft.println("Water Level:");  
+      tft.fillRect(0, 190, 320, 120, ILI9340_BLACK);
+      tft.setTextColor(ILI9340_WHITE);
+      tft.setTextSize(3);
+      tft.print(analogRead(waterPin));
+   }
+   
+  //user page
+   if(choose == 1 && enter == 1){
+      back = 3;
+      enter = 5; 
+   }
+   //display user page on LCD
+   else if(enter == 5){
+     tft.setCursor(0, 0);
+     tft.setTextColor(ILI9340_CYAN);
+     tft.setTextSize(4);
+     tft.println("~ USER PAGE ~");
+     tft.println();
+     tft.setTextColor(ILI9340_BLUE);
+     tft.setTextSize(3);
+     tft.print("YOUR POINTS: ");
+
+     value = EEPROM.read(addr);
+     tft.println(value);
+     userPt = value;
+   }
+
+   //start blynk
+   if(choose == 3 && enter == 1){
+    back == 9;
+    enter = 7;
+   }
+   else if(enter == 7){
+   tft.setCursor(0, 0);
+   tft.setTextColor(ILI9340_YELLOW);
+   tft.setTextSize(3);
+   tft.println("Start");
+   tft.println("Blynking!");
+   tft.setTextColor(ILI9340_GREEN);
+   tft.println("USB Connection with Computer!");
+
+   Blynk.run();
+  
+  //sending email to remind about the water container
+
+  if(analogRead(waterPin) < 80 && calls < maxCalls){
+    x=5;
+  }
+
+  if(x == 5){
+   Blynk.email("yukiluna1999@gmail.com", "Subject: Add Water", "Please add water to your water container!");
+    
+    calls += 1;
+  }
+
+   //counter for water level
+   if (analogRead(waterPin) > 400){
+    callCounter += 1;
+   }
+   if (callCounter > 30){
+    calls = 0;
+    callCounter = 0;
+   }
+  
+   }
+
+   //quiz  
+   if(choose == 2 && enter == 1){
+      back = 9;
+      enterState = LOW;
+      enter = 6;
+      
+   }
+   else if (enter == 6){
+  tft.setCursor(0, 0);
+  tft.setTextColor(ILI9340_YELLOW);
+  tft.setTextSize(4);
+  tft.println("~ QUIZ ~");
+  tft.setCursor(30, 40);
+  tft.setTextColor(ILI9340_RED);
+  tft.setTextSize(3);
+  tft.println("Press ENTER to Start!");
+  tft.setCursor(30, 100);
+  tft.println("Press BACK to Leave!");
+   }
+  //if the user confirms that she wants to start quiz by pressing the ENTER buton
+  if(enterStateQ == HIGH){
+    tft.fillScreen(ILI9340_BLACK);
+    //quiz = 1;
+    randNumberStart = 1;
+    enterStateQ = LOW;
+    enter = 9;
+  }
+  //how the ENTER button will be used during the quiz
+   if (enterStateA == HIGH){
+  quizAnswer = 1;
+  enterStateA = LOW;
+   }
+
+//If now the CURSOR button is pressed, the user will be able to select the answer
+   if (chooseStateQ == HIGH){
+    tft.fillRect(160, 210, 30, 30, ILI9340_BLACK);
+    quizSelect ++;
+     delay(200);
+  }
+
+char selectAnswer;
+if(quizSelect == 0){
+  selectAnswer = 'A';
+}
+else if(quizSelect == 1){
+  selectAnswer = 'B';
+}
+else if(quizSelect == 2){
+  selectAnswer = 'C';
+}
+else if(quizSelect == 3){
+  selectAnswer = 'D';
+}
+else if(quizSelect > 3){
+  quizSelect = 0;
+}
+
+if (randNumberStart == 1){
+randNumber = random(1,20);
+//clear the screen to display question
+randNumberStart = 0;
+quiz = 1;
+}
+
+if(quiz == 1){ 
+String question = "";
+//all the question in the SD card are labeled like "1.TXT" "2.TXT"
+//In that way, arduino can find the question that corresponds to the randomly genrated integer
+question += randNumber;
+question += ".TXT";
+
+Serial.println(question);
+//arduino find and open the specific question in SD card
+myFile=SD.open(question);
+//arduino will store what it read into any array
+char readByteQ [150] = "";
+
+//counter helps arduino to store each letter of the question in the array
+int counter = 0;
+while(myFile.available()){
+  //read the question file and store it in array readByteQ
+  readByteQ [counter] = myFile.read();
+  if(readByteQ [counter] == '^'){
+    //at the end of the question, there is a ^ to indicate that it is the end
+    //if the arduino read this symbol, it will stop reading the file
+    break;
+  }
+  else{
+    //if arduino doesn't detect the symbol, it will move on to read the next letter
+    counter++;
+  }
+}
+
+  //print the question onto the LCD
+  tft.setCursor(0, 0);  
+  tft.setTextColor(ILI9340_GREEN);
+  tft.setTextSize(3);
+  for(int i = 0; i < (counter); i=i+1){
+    Serial.print(readByteQ[i]);
+    tft.print(readByteQ[i]);
+  }
+  Serial.println();
+  tft.println();
+
+
+  delay(20);
+  //it reset the counter and close the question file
+  counter = 0;
+  myFile.close();
+
+  //the choices for each question in the SD card are labeled like "1C.TXT" "2C.TXT"
+  String choice = "";
+  choice += randNumber;
+  choice += "C.TXT";
+
+Serial.println(choice);
+
+//open the corresponding choice file and read the file like the quesition file
+myFile=SD.open(choice);
+char readByteC [250] = "";
+
+while(myFile.available()){
+  readByteC [counter] = myFile.read();
+  if(readByteC [counter] == '^'){
+    break;
+  }
+  else{
+    counter++;
+  }
+}
+
+  //print the multiple choice on LCD
+  tft.setTextColor(ILI9340_YELLOW);
+  tft.setTextSize(2);
+ 
+  for(int i = 0; i < counter; i=i+1){
+    Serial.print(readByteC[i]);
+    tft.print(readByteC[i]);
+  }
+
+  delay(50);
+  counter = 0;
+  myFile.close();
+
+quiz = 2;
+}
+if(quiz == 2){
+  tft.setCursor(0, 210);  
+  tft.setTextColor(ILI9340_WHITE);
+  tft.setTextSize(2);
+  tft.print("Your Answer: ");
+  tft.println(selectAnswer);
+  
+//the answers for each question are labeled like "1A.TXT" "2A.TXT"
+String answer = "";
+answer += randNumber;
+answer += "A.TXT";
+
+myFile = SD.open(answer);
+Serial.println(answer);
+
+while(myFile.available()){
+  answerCheck [0] = myFile.read();
+  counter++;
+}
+
+myFile.close();
+  
+Serial.println(answerCheck[0] );
+
+if(quizAnswer == 1){
+//After the user has selected her answer and confirm it by pressing ENTER,
+//arduino will check if the right answer and the user's answer are the same or not
+if (answerCheck[0] == selectAnswer){
+  tft.fillScreen(ILI9340_GREEN);
+  tft.setCursor(0, 0);  
+  tft.setTextColor(ILI9340_YELLOW);
+  tft.setTextSize(5);
+  tft.println("RIGHT");
+  tft.println("ANSWER!");
+
+  //if the user answer correctly, the user point will increase by 1 and get stored in arduino's harddrive
+  userPt += 1;
+  EEPROM.write(addr, userPt);
+}
+else{
+  tft.fillScreen(ILI9340_RED);
+  tft.setCursor(0, 0);  
+  tft.setTextColor(ILI9340_BLACK);
+  tft.setTextSize(5);
+  tft.println("WRONG");
+  tft.println("ANSWER!");
+}
+
+delay(1500);
+quizAnswer = 0;
+}  
+
+//After 1.5 seconds, the arduino will clear the screen and move on to the next question
+if (quizAnswer == 0){
+  counter = 0;
+  counterAC = 0;
+  quizSelect = 0;
+  quiz = 3;
+ 
+  tft.fillScreen(ILI9340_BLACK);
+  randNumberStart = 1;
+   quizAnswer = 9;
+}
+}
+
+
+delay(50);
+}
+
+//These allow arduino to data that are not direct readings from analog or digital pins to BLYNK
+//These data are sent to assigned virtual pins
+BLYNK_READ(V0){
+  Blynk.virtualWrite(V0, analogRead(tempPin) * 0.48828 - 50);//send temperature in Celsius
+}
+BLYNK_READ(V1){
+  degreesC = analogRead(tempPin) * 0.48828 - 50;
+  degreesF = degreesC * 1.8 + 32.0;
+
+  Blynk.virtualWrite(V1, degreesF);//send temperature in Fahrenheit
+}
+BLYNK_READ(V2){
+  Blynk.virtualWrite(V2, userPt);//send the user point
+}
+
+
+
+
+
+  
